@@ -1,0 +1,586 @@
+#!/usr/node/bin/node
+// /usr/node/bin/node --abort_on_uncaught_exception
+/*
+ *
+ */
+
+require('/usr/node/node_modules/platform_node_version').assert();
+
+var assert = require('assert');
+var events = require('events');
+var net = require('net');
+var util = require('util');
+
+var onlyif = require('/usr/node/node_modules/onlyif');
+
+var NAME = 'qmpadm';
+var VERSION = '0.0.1';
+var ZONE_PATH  = '/zones/';
+var QMP_SOCKET = '/root/tmp/vm.qmp';
+
+function QMP(logger) {
+    var self = this;
+    
+    self.counter = 0;
+    self.connected = false;
+    self.send_queue = {};
+    self.stream;
+    self.emitter = new events.EventEmitter();
+    
+    if (logger) {
+        self.log = logger;
+    } else {
+        self.log = {
+            debug: function(msg) { console.log('[DEBUG] ',msg); },
+            info:  function(msg) { console.log('[INFO ] ',msg); },
+            warn:  function(msg) { console.log('[WARN ] ',msg); },
+            error: function(msg) { console.log('[ERROR] ',msg); }
+        };
+    }
+    
+    self.emitter.on('send', function() {
+        
+        if (self.connected) {
+            var id, idList = [], msg;
+            
+            for (id in self.send_queue) {
+                idList.push(id);
+            }
+            
+            idList.sort(function(a,b) {
+                return Number(a) - Number(b);
+            });
+            
+            for (id in idList) {
+                id = idList[id];
+                msg = self.send_queue[id];
+                if (msg && !msg.sent) {
+                    self.log.debug('send message: ' + JSON.stringify(msg));
+                    self.send(msg);
+                }
+            }
+        } else {
+            self.log.debug('Received "send" but not connected.');
+        }
+    });
+}
+
+QMP.prototype.send = function(message) {
+    var self = this;
+    
+    if (self.stream && self.stream.writable) {
+        self.log.info('sending message [' + message.command.id + ']: ' + JSON.stringify(message));
+        self.stream.write(JSON.stringify(message.command));
+        message.sent = true;
+    } else {
+        self.log.warn('send() called when disconnected. Message id ' + message.command.id);
+        var callback = self.send_queue[message.command.id].callback;
+        callback(new Error('send called on closed socket'));
+        delete self.send_queue[message.command.id];
+    }
+};
+
+QMP.prototype.connect = function(socket, callback) {
+    var self = this;
+    
+    var chunks, id, result, cb, emsg, buffer = '';
+    
+    self.socket = socket;
+    self.stream = new net.Stream();
+    self.stream.setEncoding('utf8');
+    
+    self.stream.on('data', function(chunk) {
+        buffer += chunk.toString();
+        chunks = buffer.split('\n');
+        while (chunks.length > 1) {
+            result = JSON.parse(chunks.shift());
+            if (result.hasOwnProperty('QMP')) {
+                // greeting message
+                self.log.info('QMP greeting: ' + JSON.stringify(result));
+            } else if (result.hasOwnProperty('return')) {
+                // success message
+                self.log.info('QMP[' + result.id + '] result: ' + JSON.stringify(result));
+                if (result.hasOwnProperty('id')) {
+                    cb = self.send_queue[result.id].callback;
+                    cb(null, result['return']);
+                    delete self.send_queue[result.id];
+                } else {
+                    self.log.warn('no id in result [' + JSON.stringify(result) + ']');
+                }
+            } else if (result.hasOwnProperty('event')) {
+                // ???
+                result.timestamp = new Date((result.timestamp.seconds * 1000000
+                    + result.timestamp.microseconds) / 1000).toISOString();
+                self.log.debug('QMP event: ' + JSON.stringify(result));
+            } else if (result.hasOwnProperty('error')) {
+                // error message
+                self.log.error('QMP[' + result.id + '] error: ' + JSON.stringify(result));
+                if (result.hasOwnProperty('id')) {
+                    cb = self.send_queue[result.id].callback;
+                    emsg = result.error.class + ': ' + result.error.desc + '; data: '
+                        + JSON.stringify(result.error.data);
+                    cb(new Error(emsg), result['error']);
+                    delete self.send_queue[result.id];
+                } else {
+                    self.log.warn('no id in result [' + JSON.stringify(result) + ']');
+                }
+            } else {
+                self.log.error('QMP error: ' + JSON.stringify(result));
+            }
+        }
+        buffer = chunks.pop();
+    });
+    
+    self.stream.on('close', function() {
+        self.log.info('QMP socket closed');
+        self.connected = false;
+        self.stream.end();
+        
+        for (id in self.send_queue) {
+            self.send(self.send_queue[id]);
+        }
+    });
+    
+    self.stream.on('error', function(e) {
+        callback(e);
+    });
+    
+    self.stream.connect(self.socket, function(error) {
+        if (!error) {
+            // notify qmp that we are ready to send/receive
+            self.command('qmp_capabilities', null, function(e) {
+                // got a response. ready to send/receive
+                self.connected = true;
+                // send queue
+                self.emitter.emit('send');
+            });
+        }
+        callback(error);
+    });
+};
+
+QMP.prototype.disconnect = function() {
+    var self = this;
+    if (self.stream) {
+        self.stream.end();
+    }
+};
+
+QMP.prototype.command = function(command, args, callback) {
+    var self = this;
+    
+    var id = self.counter++;
+    var message = {
+        'execute': command,
+        'id': id
+    };
+    
+    self.log.info('QMP['+id+'] command: ' + command);
+    
+    if (args) {
+        message.arguments = args;
+    }
+    
+    self.send_queue[id] = {
+        'command': message,
+        'sent': false,
+        'callback': callback
+    };
+    
+    // Send qmp_capabilities immediately to complete handshake
+    if (command === 'qmp_capabilities' && !self.connected) {
+        self.send(self.send_queue[id]);
+    } else {
+        self.emitter.emit('send');
+    }
+};
+
+function isUuid(uuid) {
+    if (uuid && uuid.length === 36 && uuid.match(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/)) {
+        return true;
+    }
+    return false;
+}
+
+function QMPADM(logger) {
+    var self = this;
+    self.version = '0.0.1';
+    self.name = NAME;
+    self.commands = {
+        'change': {
+            'device': {'key': '-d', 'required': true, type: String},
+            'target': {'key': '-t', 'required': true, type: String},
+            'arg':    {'key': '-a', 'required': false, type: String},
+            'qmadm_help': [
+                'Change removable media or VNC configuration',
+                '',
+                '    Arguments:',
+                '    -d        device name to modify. See "query-block" for device names.',
+                '    -t        target file name or item',
+                '    -a        additional arguments (OPTIONAL)',
+                '',
+                '    Examples:',
+                '    Load "virtio.iso" on cd-rom "ide1-cd0"',
+                '    %s <zone uuid> change -d ide1-cd0 -t /virtio.iso',
+                '',
+                '    Change VNC password',
+                '    %s <zone uuid> change -d vnc -t password -a foobar1'
+            ]
+        },
+        'eject': {
+            'force':  {'key': '-f', 'required': false, type: Boolean, 'default': false},
+            'device': {'key': '-d', 'required': true, type: String},
+            'qmadm_help': [
+                'Eject removable media',
+                '',
+                '    Arguments:',
+                '    -d        device name to eject. See "query-block" for device names.',
+                '    -f        force eject (OPTIONAL)',
+                '',
+                '    Examples:',
+                '    Eject cd-rom "ide1-cd0"',
+                '    %s <zone uuid> eject -d ide1-cd0',
+                '',
+                '    Force eject cd-rom "ide1-cd0"',
+                '    %s <zone uuid> change -d ide1-cd0 -f'
+            ]
+        },
+        
+        'query-balloon':                {},
+        'query-block':                  {},
+        'query-blockstats':             {},
+        'query-chardev':                {},
+        'query-commands':               {},
+        'query-command-line-options':   {},
+        'query-cpus':                   {},
+        'query-kvm':                    {},
+        'query-mice':                   {},
+        'query-migrate':                {},
+        'query-name':                   {},
+        'query-pci':                    {},
+        'query-status':                 {},
+        'query-uuid':                   {},
+        'query-version':                {},
+        'query-vnc':                    {},
+        
+        'quit':                         {},
+        
+        'system_powerdown':             {},
+        'system_reset':                 {},
+        'system_wakeup':                {},
+
+        'screendump': {
+            'filename':  {'required': true, type: String}
+        }
+    };
+    
+    if (logger) {
+        self.log = logger;
+    } else {
+        self.log = {
+            'debug': function() {
+                if (self.verbose) {
+                    console.log('[DEBUG] ', arguments[0], (arguments[1]!==undefined)?arguments[1]:'', (arguments[2]!==undefined)?arguments[2]:'', (arguments[3]!==undefined)?arguments[3]:'');
+                }
+            },
+            'info':  function() {
+                console.log('[INFO ] ', arguments[0], (arguments[1]!==undefined)?arguments[1]:'', (arguments[2]!==undefined)?arguments[2]:'', (arguments[3]!==undefined)?arguments[3]:'');
+            },
+            'warn':  function() {
+                console.log('[WARN ] ', arguments[0], (arguments[1]!==undefined)?arguments[1]:'', (arguments[2]!==undefined)?arguments[2]:'', (arguments[3]!==undefined)?arguments[3]:'');
+            },
+            'error': function() {
+                console.log('[ERROR] ', arguments[0], (arguments[1]!==undefined)?arguments[1]:'', (arguments[2]!==undefined)?arguments[2]:'', (arguments[3]!==undefined)?arguments[3]:'');
+            }
+        };
+    }
+}
+
+QMPADM.prototype.printHelp = function(command) {
+    var self = this;
+    
+    var help = [
+        'Manage active KVM instances.\n',
+        'Usage:',
+        '    %s [options] <zone uuid> <command> [<args>...]',
+        '    %s help <command>',
+        '',
+        'Options:',
+        '    -h, --help           Show this help message and exit.',
+        '    --version            Show version and exit.',
+        '    -v, --verbose        Show version and exit.',
+        ''
+    ];
+    
+    var detailed;
+    
+    if (command && command.length > 0) {
+        if (!self.commands[command].qmadm_help || self.commands[command].qmadm_help.length === 0) {
+            detailed = ['Detailed help not available for '+command, ''];
+        } else {
+            detailed = self.commands[command].qmadm_help;
+            detailed = detailed.concat(['']);
+        }
+    } else {
+        detailed = [
+            'Commands:',
+            '    %s help [<command>]                help on commands',
+
+            '    %s <zone uuid> change              change removable media or VNC configuration',
+            '    %s <zone uuid> eject               eject removable media',
+            '    %s <zone uuid> query-balloon       show balloon information',
+            '    %s <zone uuid> query-block         show block devices',
+            '    %s <zone uuid> query-blockstats    show block device statistics',
+            '    %s <zone uuid> query-chardev       show character devices',
+            '    %s <zone uuid> query-commands      show supported QMP commands',
+            /*'    %s <zone uuid> query-command-line-options\n'
+           +'                                       show command line options',*/
+            '    %s <zone uuid> query-cpus          show cpu information',
+            '    %s <zone uuid> query-kvm           show KVM information',
+            '    %s <zone uuid> query-mice          show mice information',
+            '    %s <zone uuid> query-migrate       show migration status',
+            '    %s <zone uuid> query-name          show VM name',
+            '    %s <zone uuid> query-pci           show pci devices',
+            '    %s <zone uuid> query-status        show VM status',
+            '    %s <zone uuid> query-uuid          show UUID',
+            '    %s <zone uuid> query-version       show QEMU version',
+            '    %s <zone uuid> query-vnc           show VNC information',
+            '    %s <zone uuid> quit                quit the emulator. WARNING: this will stop the qemu\n'
+           +'                                           process without sending a shutdown signal.',
+            '    %s <zone uuid> system_powerdown    send system power down event',
+            '    %s <zone uuid> system_reset        reset the system',
+            '    %s <zone uuid> system_wakeup       wake up system from suspend',
+            '',
+            'See `%s help <command>` for more details.',
+            ''
+        ];
+    }
+    
+    help = help.concat(detailed);
+    
+    console.log(help.join('\n').replace(/%s/g, self.name));
+};
+
+QMPADM.prototype.printError = function(err) {
+    var self = this;
+    if (err) {
+        if (err.code) {
+            self.log.error(self.name + ': error ('+err.code+'):', err.message);
+        } else {
+            self.log.error(self.name + ': error:', err.message || err);
+        }
+        
+        if (self.verbose && err.stack) {
+            self.log.error('\n' + err.stack);
+        }
+    }
+};
+
+
+QMPADM.prototype.parseArgs = function(args) {
+    var self = this;
+    var opts = {
+        'command': '',
+        'command_arguments': {},
+        'command_function': undefined,
+        'zone': '',
+        'help_command': ''
+    };
+    
+    self.log.debug('incoming argv:', args);
+    
+    var zoneId = false;
+    var command = false;
+    var help = false;
+    
+    if (args.length > 0) {
+        // pop the prog name
+        args.shift();
+        args.shift();
+    }
+
+    while (args.length > 0) {
+        // GET Zone UUID
+        if (!zoneId) {
+            var arg = args.shift();
+            
+            if (arg === 'help' || arg === '-h' || arg === '-?') {
+                opts.command = 'help';
+                opts.help_command = '';
+                zoneId = help = true;
+            } else if (arg === '-v' || arg === '--verbose') {
+                self.verbose = true;
+                continue;
+            } else if (arg === '--version') {
+                console.log(NAME,' version ',VERSION);
+                process.exit(0);
+            } else if (isUuid(arg)) {
+                opts.zone = arg;
+                zoneId = true;
+            } else {
+                args.unshift(arg);
+            }
+        }
+        
+        if (command) {
+            var cmd = self.commands[opts.command];
+            var option = '';
+            
+            self.log.debug('parse command options:',cmd);
+            
+            while (args.length > 0) {
+                var arg = args.shift();
+                
+                self.log.debug('arg:',arg);
+                
+                if (arg.match(/^-/)) {
+                    option === '';
+                    for (var prop in cmd) {
+                        if (prop === 'qmadm_help') { continue; }
+                        if (cmd.hasOwnProperty(prop) && cmd[prop].key === arg) {
+                            option = prop;
+                            break;
+                        }
+                    }
+                    self.log.debug('option:', option);
+                    
+                    if (option === '') {
+                        self.printError({'message': 'Option '+arg+' not a valid option for '+opts.command});
+                        process.exit(2);
+                    }
+                    
+                    if (cmd[option].type === Boolean && cmd[option].hasOwnProperty('default')) {
+                        opts.command_arguments[option] = ! cmd[option].default;
+                    }
+                } else if (option !== '') {
+                    self.log.debug('option:', option);
+                    if (cmd[option].type === Boolean) {
+                         opts.command_arguments[option] = Boolean(arg);
+                    } else {
+                        opts.command_arguments[option] = arg;
+                    }
+                    self.log.debug('opts['+option+']:', opts.command_arguments[option]);
+                    option = '';
+                }
+            }
+            
+        } else if (help) {
+            opts.help_command = args.shift();
+            if (opts.help_command && !self.commands.hasOwnProperty(opts.help_command)) {
+                self.printError({'message': 'Unknown command '+opts.help_command});
+                opts.help_command = '';
+            }
+            break;
+        } else {
+            opts.command = args.shift();
+            
+            var validCommand = self.commands.hasOwnProperty(opts.command);
+            
+            if (opts.command === 'help' || opts.command === '-h') {
+                help = true;
+                opts.command = 'help';
+                opts.help_command = '';
+            } else if (validCommand) {
+                command = true;
+                var done = true;
+                var cmd = self.commands[opts.command];
+                for (var p in cmd) {
+                    if (cmd.hasOwnProperty(p)) { done = false; break; }
+                }
+                if (done) {
+                    break;
+                }
+            } else if (!validCommand) {
+                self.printError({'message': 'Unknown command '+opts.command});
+                process.exit(2);
+            }
+        }
+    }
+    
+    self.log.debug('check parsed args; command:', opts.command);
+    
+    if (opts.command !== 'help' && (!opts.zone || opts.zone === '')) {
+        self.printError({'message': 'A KVM zone UUID is required.'});
+        process.exit(2);
+    } else if (opts.command !== 'help' && (!opts.command || opts.command === '')) {
+        self.printError({'message': 'No command specified.'});
+        process.exit(2);
+    } else if (opts.command !== 'help') {
+        var cmd = self.commands[opts.command];
+        //opts.command_function = cmd.qmadm_function;
+        
+        for (var arg in cmd) {
+            if (cmd.hasOwnProperty(arg)) {
+                if (cmd[arg].required && !opts.command_arguments.hasOwnProperty(arg)) {
+                    self.printError({'message': 'Command '+opts.command+' is missing required field '+cmd[arg].key+'.\nSee help for details on usage.'});
+                    process.exit(2);
+                }
+            }
+        }
+    }
+    
+    return opts;
+};
+
+QMPADM.prototype.doCommand = function(opts, callback) {
+    var self = this;
+    
+    var socket = ZONE_PATH + opts.zone + QMP_SOCKET;
+    var qmp;
+    
+    if (self.verbose) {
+        qmp = new QMP(self.log);
+    } else {
+        qmp = new QMP({
+            debug: function(){},
+            info: function(){},
+            warn: function(){},
+            error: function(){}
+        });
+    }
+    
+    qmp.connect(socket, function(error) {
+        if (error) {
+            self.printError({'message': 'Error connecting to zone: ' +opts.zone+'; socket: '+socket+'; Error: '+error});
+        } else {
+            self.log.info('Connected to KVM', opts.zone, 'QMP socket');
+            
+            if (opts.command_arguments && opts.command_arguments.length === 0) {
+                opts.command_arguments = null;
+            }
+            qmp.command(opts.command, opts.command_arguments, function(error, results) {
+                 callback(error, results);
+                 qmp.disconnect();
+            });
+        }
+    });
+};
+
+onlyif.rootInSmartosGlobal(function (onlyifErr) {
+    var qmpadm = new QMPADM();
+
+    if (onlyifErr) {
+        self.printError({'message': 'cannot run: ' + onlyifErr});
+        process.exit(2);
+    }
+    
+    var opts = qmpadm.parseArgs(process.argv);
+    qmpadm.log.debug('parsed:', opts);
+    
+    if (opts.command === 'help') {
+        qmpadm.printHelp(opts.help_command);
+    } else {
+        qmpadm.doCommand(opts, function(error, result) {
+            if (error) {
+                qmpadm.printError(error);
+            } else {
+                if (Object.keys(result).length === 0) {
+                    qmpadm.log.info('QMP results: Successful');
+                } else {
+                    qmpadm.log.info('QMP results:');
+                    console.log(JSON.stringify(result, null, 4));
+                }
+            }
+        });
+    }
+});

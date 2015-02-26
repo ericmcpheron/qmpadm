@@ -1,0 +1,15 @@
+{
+    "name": "qmpadm",
+    "version": "0.0.1",
+    "description": "",
+    "author": "Eric McPheron",
+    "main": "qmpadm",
+    "repository": "",
+    "bin": "",
+    "license": {
+        "type": "",
+        "url": ""
+    },
+    "dependencies": {
+    }
+}
