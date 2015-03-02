@@ -1,202 +1,173 @@
-#!/usr/node/bin/node
-// /usr/node/bin/node --abort_on_uncaught_exception
+#!/usr/node/bin/node --abort_on_uncaught_exception
 /*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License, Version 1.0 only
+ * (the "License").  You may not use this file except in compliance
+ * with the License.
+ *
+ * You can obtain a copy of the license at http://smartos.org/CDDL
+ *
+ * See the License for the specific language governing permissions
+ * and limitations under the License.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file.
+ *
+ * If applicable, add the following below this CDDL HEADER, with the
+ * fields enclosed by brackets "[]" replaced with your own identifying
+ * information: Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ *
+ * Copyright (c) 2014 Joyent Inc., All rights reserved.
  *
  */
 
-require('/usr/node/node_modules/platform_node_version').assert();
+ // SmartOS specific libraries
+var onlyif = require('/usr/node/node_modules/onlyif');
+var Qmp = require('/usr/vm/node_modules/qmp').Qmp;
 
-var assert = require('assert');
-var events = require('events');
 var net = require('net');
 var util = require('util');
 
-var onlyif = require('/usr/node/node_modules/onlyif');
-
 var NAME = 'qmpadm';
-var VERSION = '0.0.1';
-var ZONE_PATH  = '/zones/';
+var VERSION = '0.0.2';
+var POOL_PATH  = '/zones/';
 var QMP_SOCKET = '/root/tmp/vm.qmp';
 
-function QMP(logger) {
-    var self = this;
-    
-    self.counter = 0;
-    self.connected = false;
-    self.send_queue = {};
-    self.stream;
-    self.emitter = new events.EventEmitter();
-    
-    if (logger) {
-        self.log = logger;
-    } else {
-        self.log = {
-            debug: function(msg) { console.log('[DEBUG] ',msg); },
-            info:  function(msg) { console.log('[INFO ] ',msg); },
-            warn:  function(msg) { console.log('[WARN ] ',msg); },
-            error: function(msg) { console.log('[ERROR] ',msg); }
-        };
-    }
-    
-    self.emitter.on('send', function() {
-        
-        if (self.connected) {
-            var id, idList = [], msg;
-            
-            for (id in self.send_queue) {
-                idList.push(id);
-            }
-            
-            idList.sort(function(a,b) {
-                return Number(a) - Number(b);
-            });
-            
-            for (id in idList) {
-                id = idList[id];
-                msg = self.send_queue[id];
-                if (msg && !msg.sent) {
-                    self.log.debug('send message: ' + JSON.stringify(msg));
-                    self.send(msg);
-                }
-            }
-        } else {
-            self.log.debug('Received "send" but not connected.');
-        }
-    });
-}
 
-QMP.prototype.send = function(message) {
-    var self = this;
-    
-    if (self.stream && self.stream.writable) {
-        self.log.info('sending message [' + message.command.id + ']: ' + JSON.stringify(message));
-        self.stream.write(JSON.stringify(message.command));
-        message.sent = true;
-    } else {
-        self.log.warn('send() called when disconnected. Message id ' + message.command.id);
-        var callback = self.send_queue[message.command.id].callback;
-        callback(new Error('send called on closed socket'));
-        delete self.send_queue[message.command.id];
-    }
-};
+/*
+ * The below code was copied directly from Joyent SmartOS (/usr/vm/node_modules/qmp.js) with
+ * modification to handle error responses from the QMP socket.
+ *
+ * Copyright (c) 2014 Joyent Inc., All rights reserved.
+ */
+Qmp.prototype.connect = function (socket, callback)
+{
+    var qmp = this;
+    var chunks, result, buffer = '', id, cb;
+    qmp.stream = new net.Stream();
 
-QMP.prototype.connect = function(socket, callback) {
-    var self = this;
-    
-    var chunks, id, result, cb, emsg, buffer = '';
-    
-    self.socket = socket;
-    self.stream = new net.Stream();
-    self.stream.setEncoding('utf8');
-    
-    self.stream.on('data', function(chunk) {
+    qmp.stream.setEncoding('utf8');
+    qmp.stream.on('data', function (chunk) {
         buffer += chunk.toString();
         chunks = buffer.split('\n');
         while (chunks.length > 1) {
             result = JSON.parse(chunks.shift());
             if (result.hasOwnProperty('QMP')) {
-                // greeting message
-                self.log.info('QMP greeting: ' + JSON.stringify(result));
+                // This is the initial banner/greeting message
+                qmp.log.info('QMP greeting:' + JSON.stringify(result));
             } else if (result.hasOwnProperty('return')) {
-                // success message
-                self.log.info('QMP[' + result.id + '] result: ' + JSON.stringify(result));
+                qmp.log.info('QMP[' + result.id + '] result: '
+                    + JSON.stringify(result));
                 if (result.hasOwnProperty('id')) {
-                    cb = self.send_queue[result.id].callback;
+                    id = result.id;
+                    cb = qmp.in_transit[id].callback;
                     cb(null, result['return']);
-                    delete self.send_queue[result.id];
+                    delete qmp.in_transit[id];
                 } else {
-                    self.log.warn('no id in result [' + JSON.stringify(result) + ']');
+                    qmp.log.warn('WARNING: no id in result [', result, ']');
                 }
             } else if (result.hasOwnProperty('event')) {
-                // ???
                 result.timestamp = new Date((result.timestamp.seconds * 1000000
                     + result.timestamp.microseconds) / 1000).toISOString();
-                self.log.debug('QMP event: ' + JSON.stringify(result));
+                qmp.log.debug('QMP event: ' + JSON.stringify(result));
+            /*
+             * BEGIN Error handler
+             */
             } else if (result.hasOwnProperty('error')) {
-                // error message
-                self.log.error('QMP[' + result.id + '] error: ' + JSON.stringify(result));
+                // QMP returns errors with an 'error' property
+                qmp.log.error('QMP[' + result.id + '] result: '
+                    + JSON.stringify(result));
                 if (result.hasOwnProperty('id')) {
-                    cb = self.send_queue[result.id].callback;
-                    emsg = result.error.class + ': ' + result.error.desc + '; data: '
-                        + JSON.stringify(result.error.data);
+                    id = result.id;
+                    cb = qmp.in_transit[id].callback;
+                    var emsg = result.error.class + ': ' + result.error.desc;
                     cb(new Error(emsg), result['error']);
-                    delete self.send_queue[result.id];
+                    delete qmp.in_transit[id];
                 } else {
-                    self.log.warn('no id in result [' + JSON.stringify(result) + ']');
+                    qmp.log.warn('WARNING: no id in result [', result, ']');
                 }
+            /*
+             * END Error handler
+             */
             } else {
-                self.log.error('QMP error: ' + JSON.stringify(result));
+                qmp.log.error('QMP error: ' + JSON.stringify(result));
             }
         }
         buffer = chunks.pop();
     });
-    
-    self.stream.on('close', function() {
-        self.log.info('QMP socket closed');
-        self.connected = false;
-        self.stream.end();
-        
-        for (id in self.send_queue) {
-            self.send(self.send_queue[id]);
+
+    qmp.stream.on('close', function () {
+        qmp.log.info('QMP socket was closed');
+        qmp.connected = false;
+        qmp.stream.end();
+
+        // force any remaining messages to fail
+        for (id in qmp.in_transit) {
+            qmp.send(qmp.in_transit[id]);
         }
     });
-    
-    self.stream.on('error', function(e) {
+
+    qmp.socket = socket;
+
+    qmp.stream.on('error', function (e) {
         callback(e);
     });
-    
-    self.stream.connect(self.socket, function(error) {
-        if (!error) {
-            // notify qmp that we are ready to send/receive
-            self.command('qmp_capabilities', null, function(e) {
-                // got a response. ready to send/receive
-                self.connected = true;
-                // send queue
-                self.emitter.emit('send');
+
+    function on_connect(err) {
+        if (!err) {
+            qmp.command('qmp_capabilities', null, function (e) {
+                // response to our capabilities request, ready for others to
+                // send now.
+                qmp.connected = true;
+                // send anything that's been waiting.
+                qmp.emitter.emit('send');
             });
         }
-        callback(error);
-    });
+        callback(err);
+    }
+
+    qmp.stream.connect(qmp.socket, on_connect);
 };
 
-QMP.prototype.disconnect = function() {
-    var self = this;
-    if (self.stream) {
-        self.stream.end();
-    }
-};
-
-QMP.prototype.command = function(command, args, callback) {
+function Byte(val) {
     var self = this;
     
-    var id = self.counter++;
-    var message = {
-        'execute': command,
-        'id': id
-    };
-    
-    self.log.info('QMP['+id+'] command: ' + command);
-    
-    if (args) {
-        message.arguments = args;
-    }
-    
-    self.send_queue[id] = {
-        'command': message,
-        'sent': false,
-        'callback': callback
-    };
-    
-    // Send qmp_capabilities immediately to complete handshake
-    if (command === 'qmp_capabilities' && !self.connected) {
-        self.send(self.send_queue[id]);
+    var arr = val.toLowerCase().match(/^(\d+)([bkmgt])?$/);
+    if (arr) {
+        self.value = parseInt(arr[1]);
+        if (arr.length > 2) {
+            self.radix = arr[2];
+        } else {
+            self.radix = 'b';
+        }
     } else {
-        self.emitter.emit('send');
+        throw util.format('Invalid byte value %s', val);
     }
+}
+Byte.prototype.toInt = function() {
+    var self = this;
+    var val = self.value;
+    switch(self.radix) {
+        case 'k': val = val * 1024;
+            break;
+        case 'm': val = val * Math.pow(1024, 2);
+            break;
+        case 'g': val = val * Math.pow(1024, 3);
+            break;
+        case 't': val = val * Math.pow(1024, 4);
+            break;
+    }
+    return val;
 };
 
 function isUuid(uuid) {
-    if (uuid && uuid.length === 36 && uuid.match(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/)) {
+    if (uuid
+        && uuid.length === 36
+        && uuid.match(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/)) {
         return true;
     }
     return false;
@@ -204,20 +175,21 @@ function isUuid(uuid) {
 
 function QMPADM(logger) {
     var self = this;
-    self.version = '0.0.1';
+    self.version = VERSION;
     self.name = NAME;
+    self.pool = POOL_PATH;
     self.commands = {
-        'change': {
-            'device': {'key': '-d', 'required': true, type: String},
-            'target': {'key': '-t', 'required': true, type: String},
-            'arg':    {'key': '-a', 'required': false, type: String},
-            'qmadm_help': [
+        change:                 {
+            device: {key: '-d', required: true, type: String},
+            target: {key: '-t', required: true, type: String},
+            arg:    {key: '-a', required: false, type: String},
+            qmadm_help: [
                 'Change removable media or VNC configuration',
                 '',
                 '    Arguments:',
-                '    -d        device name to modify. See "query-block" for device names.',
-                '    -t        target file name or item',
-                '    -a        additional arguments (OPTIONAL)',
+                '    -d        device name to modify. See "query-block" for device names. (json-string)',
+                '    -t        target file name or item  (json-string)',
+                '    -a        additional arguments  (json-string, optional)',
                 '',
                 '    Examples:',
                 '    Load "virtio.iso" on cd-rom "ide1-cd0"',
@@ -227,15 +199,15 @@ function QMPADM(logger) {
                 '    %s <zone uuid> change -d vnc -t password -a foobar1'
             ]
         },
-        'eject': {
-            'force':  {'key': '-f', 'required': false, type: Boolean, 'default': false},
-            'device': {'key': '-d', 'required': true, type: String},
-            'qmadm_help': [
+        eject:                  {
+            force:  {key: '-f', required: false, type: Boolean, 'default': false},
+            device: {key: '-d', required: true, type: String},
+            qmadm_help: [
                 'Eject removable media',
                 '',
                 '    Arguments:',
-                '    -d        device name to eject. See "query-block" for device names.',
-                '    -f        force eject (OPTIONAL)',
+                '    -d        device name to eject. See "query-block" for device names.  (json-string)',
+                '    -f        force eject  (json-bool, optional)',
                 '',
                 '    Examples:',
                 '    Eject cd-rom "ide1-cd0"',
@@ -246,69 +218,449 @@ function QMPADM(logger) {
             ]
         },
         
-        'query-balloon':                {},
-        'query-block':                  {},
-        'query-blockstats':             {},
-        'query-chardev':                {},
-        'query-commands':               {},
-        'query-command-line-options':   {},
-        'query-cpus':                   {},
-        'query-kvm':                    {},
-        'query-mice':                   {},
-        'query-migrate':                {},
-        'query-name':                   {},
-        'query-pci':                    {},
-        'query-status':                 {},
-        'query-uuid':                   {},
-        'query-version':                {},
-        'query-vnc':                    {},
+        device_add:             {
+            driver: {key: '-d', required: true, type: String},
+            bus:  {key: '-b', required: false, type: String},
+            id:  {key: '-i', required: true, type: String},
+            qmadm_help: [
+                'Add a device.',
+                '',
+                '    WARNING: There is a good chance you will crash the VM when performing this action.',
+                '',
+                '    Arguments:',
+                '    -d        name of the device driver (json-string)',
+                '    -b        device parent bus (json-string, optional)',
+                '    -i        unique name (id) for the new device (json-string)',
+                '',
+                '    Examples:',
+                '    Add a new network card',
+                '    %s <zone uuid> device_add -d e1000 -i vnet1',
+                '',
+            ]
+        },
+        device_del:             {
+            id:  {key: '-i', required: true, type: String},
+            qmadm_help: [
+                'Remove a device.',
+                '',
+                '    WARNING: There is a good chance you will crash the VM when performing this action.',
+                '',
+                '    Arguments:',
+                '    -i        device name (id) (json-string)',
+                '',
+                '    Examples:',
+                '    Remove network card created in "device_add" example',
+                '    %s <zone uuid> device_del -i vnet1',
+                '',
+            ]
+        },
         
-        'quit':                         {},
-        
-        'system_powerdown':             {},
-        'system_reset':                 {},
-        'system_wakeup':                {},
+        'query-balloon':        {},
+        'query-block':          {},
+        'query-blockstats':     {},
+        'query-chardev':        {},
+        'query-commands':       {},
+        /*'query-command-line-options':   {},*/
+        'query-cpus':           {},
+        'query-kvm':            {},
+        'query-mice':           {},
+        'query-migrate':        {},
+        'query-name':           {},
+        'query-pci':            {},
+        'query-status':         {},
+        'query-uuid':           {},
+        'query-version':        {},
+        'query-vnc':            {},
 
-        'screendump': {
-            'filename':  {'required': true, type: String}
+        quit:                   {
+            qmadm_help: [
+                'Quit the emulator. ',
+                '',
+                '    WARNING: This will stop the emulator process without sending any signals to',
+                '             the guest.',
+                '',
+                '    Examples:',
+                '    %s <zone uuid> quit',
+                '',
+            ]
+        },
+        cont:                   {
+            qmadm_help: [
+                'Resume the emulator after issuing a "stop" command',
+                '',
+                '    Examples:',
+                '    %s <zone uuid> cont',
+                ''
+            ]
+        },
+        stop:                   {
+            qmadm_help: [
+                'Pause the emulator',
+                '',
+                '    Examples:',
+                '    %s <zone uuid> stop',
+                ''
+            ]
+        },
+        
+        system_powerdown:       {},
+        system_reset:           {},
+        
+        migrate:                {
+            blk: {key: '-b', required: false, type: Boolean, 'default': false},
+            inc: {key: '-i', required: false, type: Boolean, 'default': false},
+            uri: {key: '-u', required: true, type: String},
+            qmadm_help: [
+                'Migrate VM to URI',
+                '',
+                '    Arguments:',
+                '    -b        migration without shared storage with full copy of disk        (json-bool, optional)',
+                '    -i        migration without shared storage with incremental copy of disk (json-bool, optional)',
+                '              (base image shared between src and destination)',
+                '    -u        migrate to URI (json-string)',
+                '              uri format:',
+                '                  unix:<socket>            send to unix socket',
+                '                  tcp:<dest ip>:<port>     send to destination ip and port',
+                '                  exec:<command>           pipe to command',
+                '                  fd:<fd>                  send to file descriptor',
+                '',
+                '    Examples:',
+                '    Migrate using unix socket',
+                '    %s <zone uuid> migrate -d unix:/tmp/test.sock',
+                '',
+                '    Migrate using tcp',
+                '    %s <zone uuid> migrate -d tcp:192.168.1.100:4446',
+                '',
+                '    Migrate using command (gzip output and send via netcat)',
+                '    %s <zone uuid> migrate -d exec:gzip -c | nc 192.168.1.100 4446',
+                ''
+            ]
+        },
+        migrate_cancel:         {
+            qmadm_help: [
+                'Cancel current migration',
+                '',
+                '    Examples:',
+                '    %s <zone uuid> migrate_cancel',
+                ''
+            ]
+        },
+        migrate_set_speed:      {
+            value: {key: '-v', required: true, type: Byte},
+            qmadm_help: [
+                'Set maximum speed for migrations.',
+                '',
+                '    Arguments:',
+                '    -v        value in bytes per second. (json-int)',
+                '',
+                '    Examples:',
+                '    %s <zone uuid> migrate_set_speed -v 1g',
+                ''
+            ]
+        },
+        migrate_set_downtime:   {
+            value: {key: '-v', required: true, type: Number},
+            qmadm_help: [
+                'Set maximum tolerated downtime (in seconds) for migrations.',
+                '',
+                '    Arguments:',
+                '    -v        value in seconds (json-number)',
+                '',
+                '    Examples:',
+                '    %s <zone uuid> migrate_set_downtime -v 1',
+                ''
+            ]
+        },
+        client_migrate_info:    {
+            protocol:       {key: '-t', required: true, type: String},
+            hostname:       {key: '-h', required: true, type: String},
+            port:           {key: '-p', required: false, type: Number},
+            'tls-port':     {key: '-s', required: false, type: Number},
+            'cert-subject': {key: '-c', required: false, type: String},
+            qmadm_help: [
+                'Set the spice/vnc connection info for the migration target. The spice/vnc',
+                'server will ask the spice/vnc client to automatically reconnect using the',
+                'new parameters (if specified) once the vm migration finished successfully.',
+                '',
+                '    Arguments:',
+                '    -t        protocol: "spice" or "vnc" (json-string)',
+                '    -h        migration target hostname (json-string)',
+                '    -p        spice/vnc tcp port for plaintext channels (json-int, optional)',
+                '    -s        spice tcp port for tls-secured channels (json-int, optional)',
+                '    -c        server certificate subject (json-string, optional)',
+                '',
+                '    Examples:',
+                '    %s <zone uuid> client_migrate_info -t spice -h virt42.lab.kraxel.org -p 1234',
+                ''
+            ]
+        },
+        balloon:                {
+            value: {key: '-v', required: true, type: Byte},
+            qmadm_help: [
+                'Request VM to change its memory allocation (in bytes).',
+                '',
+                'NOTE: Memory ballooning not supported on SmartOS.',
+                '',
+                '    Arguments:',
+                '    -v        New memory allocation (json-int)',
+                '',
+                '    Examples:',
+                '    %s <zone uuid> balloon -v 4g',
+                ''
+            ]
+        },
+        block_passwd:           {
+            device:     {key: '-d', required: true, type: String},
+            password:   {key: '-p', required: true, type: String},
+            qmadm_help: [
+                'Set the password of encrypted block devices.',
+                '',
+                '    Arguments:',
+                '    -d        device name (json-string)',
+                '    -p        password (json-string)',
+                '',
+                '    Examples:',
+                '    %s <zone uuid> block_passwd -d ide0-hd0 -p 12345',
+                ''
+            ]
+        },
+        block_resize:           {
+            device: {key: '-d', required: true, type: String},
+            size:   {key: '-s', required: true, type: Byte},
+            qmadm_help: [
+                'Resize a block image while a guest is running.',
+                '',
+                '    Arguments:',
+                '    -d        the device\'s ID, must be unique (json-string)',
+                '    -s        new size (json-int)',
+                '',
+                '    Examples:',
+                '    %s <zone uuid> block_resize -d ide0-hd0 -s 10g',
+                ''
+            ]
+        },
+        closefd:                {
+            fdname: {key: '-f', required: true, type: String},
+            qmadm_help: [
+                'Close a file descriptor previously passed via SCM rights.',
+                '',
+                '    Arguments:',
+                '    -f        file descriptor name (json-string)',
+                '',
+                '    Examples:',
+                '    %s <zone uuid> block_resize -f fd1',
+                ''
+            ]
+        },
+        cpu:                    {
+            index: {key: '-i', required: true, type: Number},
+            qmadm_help: [
+                'Set the default CPU.',
+                '',
+                '    Arguments:',
+                '    -i        the CPU\'s index (json-int)',
+                '',
+                '    Examples:',
+                '    %s <zone uuid> cpu -i 0',
+                ''
+            ]
+        },
+        expire_password:        {
+            protocol:   {key: '-p', required: true, type: String},
+            time:       {key: '-t', required: true, type: String},
+            qmadm_help: [
+                'Set the password expire time for vnc/spice protocols.',
+                '',
+                '    Arguments:',
+                '    -p        protocol name: "spice" or "vnc" (json-string)',
+                '    -t        time: [ now | never | +secs | secs ] (json-string)',
+                '',
+                '    Examples:',
+                '    %s <zone uuid> expire_password -p vnc -t "+60"',
+                ''
+            ]
+        },
+        getfd:                  {
+            fdname: {key: '-f', required: true, type: String},
+            qmadm_help: [
+                'Receive a file descriptor via SCM rights and assign it a name.',
+                '',
+                '    Arguments:',
+                '    -f        file descriptor name (json-string)',
+                '',
+                '    Examples:',
+                '    %s <zone uuid> getfd -f fd1',
+                ''
+            ]
+        },
+        'human-monitor-command':{
+            'command-line': {key: '-c', required: true, type: String},
+            'cpu-index':    {key: '-i', required: false, type: Number},
+            qmadm_help: [
+                'Execute a Human Monitor command.',
+                '',
+                '    Arguments:',
+                '    -c        the command name and its arguments, just like the',
+                '              Human Monitor\'s shell (json-string)',
+                '    -i        select the CPU number to be used by commands which access CPU',
+                '              data, like "info registers". The Monitor selects CPU 0 if this',
+                '              argument is not provided (json-int, optional)',
+                '',
+                '    Examples:',
+                '    %s <zone uuid> human-monitor-command -c "info kvm"',
+                '',
+                'Notes:',
+                '',
+                '(1) The Human Monitor is NOT an stable interface, this means that command',
+                '    names, arguments and responses can change or be removed at ANY time.',
+                '    Applications that rely on long term stability guarantees should NOT',
+                '    use this command',
+                '',
+                '(2) Limitations:',
+                '',
+                '    o This command is stateless, this means that commands that depend',
+                '      on state information (such as getfd) might not work',
+                '',
+                '    o Commands that prompt the user for data (eg. "cont" when the block',
+                '      device is encrypted) don\'t currently work',
+                ''
+            ]
+        },
+        memsave:                {
+            val:        {key: '-v', required: true, type: Number},
+            size:       {key: '-s', required: true, type: Byte},
+            filename:   {key: '-f', required: true, type: String},
+            cpu:        {key: '-i', required: false, type: Number},
+            qmadm_help: [
+                'Save to disk virtual memory dump starting at "val" of size "size".',
+                '',
+                '    Arguments:',
+                '    -v        the starting address (json-int)',
+                '    -s        the memory size, in bytes (json-int)',
+                '    -f        file path (json-string)',
+                '    -i        virtual CPU index (json-int, optional)',
+                '',
+                '    Examples:',
+                '    %s <zone uuid> memsave -v 10 -s 100 -f /tmp/virtual-mem-dump',
+                ''
+            ]
+        },
+        netdev_add:             {
+            type:   {key: '-t', required: true, type: String},
+            id:     {key: '-i', required: true, type: String},
+            qmadm_help: [
+                'Add host network device.',
+                '',
+                '    Arguments:',
+                '    -t        the device type: "tap", "user", "socket" (json-string)',
+                '    -i        the device\'s ID, must be unique (json-string)',
+                '',
+                '    Examples:',
+                '    %s <zone uuid> netdev_add -t user -i netdev1',
+                ''
+            ]
+        },
+        netdev_del:             {
+            id:     {key: '-i', required: true, type: String},
+            qmadm_help: [
+                'Remove host network device.',
+                '',
+                '    Arguments:',
+                '    -i        the device\'s ID, must be unique (json-string)',
+                '',
+                '    Examples:',
+                '    %s <zone uuid> netdev_del -i netdev1',
+                ''
+            ]
+        },
+        pmemsave:               {
+            val:        {key: '-v', required: true, type: Number},
+            size:       {key: '-s', required: true, type: Byte},
+            filename:   {key: '-f', required: true, type: String},
+            qmadm_help: [
+                'Save to disk physical memory dump starting at "val" of size "size".',
+                '',
+                '    Arguments:',
+                '    -v        the starting address (json-int)',
+                '    -s        the memory size, in bytes (json-int)',
+                '    -f        file path (json-string)',
+                '',
+                '    Examples:',
+                '    %s <zone uuid> pmemsave -v 10 -s 100 -f /tmp/physical-mem-dump',
+                ''
+            ]
+        },
+        screendump:             {
+            filename:  {key: '-f', required: true, type: String},
+            qmadm_help: [
+                'Save screen shot into PPM image.',
+                '',
+                '    Arguments:',
+                '    -f        file path (json-string)',
+                '',
+                '    Examples:',
+                '    %s <zone uuid> screendump -f /tmp/image',
+                ''
+            ]
+        },
+        set_link:               {
+            name: {key: '-n', required: true, type: String},
+            up:   {key: '-u', required: true, type: Boolean},
+            qmadm_help: [
+                'Change the link status of a network adapter.',
+                '',
+                '    Arguments:',
+                '    -n        network adapter device name (json-string)',
+                '    -u        true = "up", false = "down" (json-bool)',
+                '',
+                '    Examples:',
+                '    Disable link for adapter e1000.0',
+                '    %s <zone uuid> set_link -n e1000.0 -u false',
+                '',
+            ]
+        },
+        set_password:           {
+            protocol:   {key: '-t', required: true, type: String},
+            password:   {key: '-p', required: true, type: String},
+            connected:  {key: '-c', required: false, type: String},
+            qmadm_help: [
+                'Set the password for vnc/spice protocols.',
+                '',
+                '    Arguments:',
+                '    -t        protocol name (json-string)',
+                '    -p        password (json-string)',
+                '    -c        connected: [ keep | disconnect | fail ] (josn-string, optional)',
+                '',
+                '    Examples:',
+                '    %s <zone uuid> set_password -t vnc -p secret',
+                ''
+            ]
+        },
+        
+        //DEV
+        'query-block-jobs':           {
+            qmadm_help: [
+                '',
+            ]
         }
     };
-    
-    if (logger) {
-        self.log = logger;
-    } else {
-        self.log = {
-            'debug': function() {
-                if (self.verbose) {
-                    console.log('[DEBUG] ', arguments[0], (arguments[1]!==undefined)?arguments[1]:'', (arguments[2]!==undefined)?arguments[2]:'', (arguments[3]!==undefined)?arguments[3]:'');
-                }
-            },
-            'info':  function() {
-                console.log('[INFO ] ', arguments[0], (arguments[1]!==undefined)?arguments[1]:'', (arguments[2]!==undefined)?arguments[2]:'', (arguments[3]!==undefined)?arguments[3]:'');
-            },
-            'warn':  function() {
-                console.log('[WARN ] ', arguments[0], (arguments[1]!==undefined)?arguments[1]:'', (arguments[2]!==undefined)?arguments[2]:'', (arguments[3]!==undefined)?arguments[3]:'');
-            },
-            'error': function() {
-                console.log('[ERROR] ', arguments[0], (arguments[1]!==undefined)?arguments[1]:'', (arguments[2]!==undefined)?arguments[2]:'', (arguments[3]!==undefined)?arguments[3]:'');
-            }
-        };
-    }
 }
 
 QMPADM.prototype.printHelp = function(command) {
     var self = this;
     
     var help = [
-        'Manage active KVM instances.\n',
+        'Manage running KVM zones using the Qemu Machine Protocol (QMP).',
+        '',
         'Usage:',
         '    %s [options] <zone uuid> <command> [<args>...]',
         '    %s help <command>',
         '',
         'Options:',
-        '    -h, --help           Show this help message and exit.',
-        '    --version            Show version and exit.',
-        '    -v, --verbose        Show version and exit.',
+        '    -h, --help                             Show this help message and exit',
+        '    --version                              Show version and exit',
+        '    -v, --verbose                          Enable verbose output including QMP messages',
+        '    -p <poo>, --pool <poo>                 Set pool containing the KVM zone to manage',
         ''
     ];
     
@@ -325,9 +677,13 @@ QMPADM.prototype.printHelp = function(command) {
         detailed = [
             'Commands:',
             '    %s help [<command>]                help on commands',
-
+            '',
             '    %s <zone uuid> change              change removable media or VNC configuration',
             '    %s <zone uuid> eject               eject removable media',
+            '',
+            '    %s <zone uuid> device_add          Add a new device',
+            '    %s <zone uuid> device_del          Remove a device',
+            '',
             '    %s <zone uuid> query-balloon       show balloon information',
             '    %s <zone uuid> query-block         show block devices',
             '    %s <zone uuid> query-blockstats    show block device statistics',
@@ -345,11 +701,41 @@ QMPADM.prototype.printHelp = function(command) {
             '    %s <zone uuid> query-uuid          show UUID',
             '    %s <zone uuid> query-version       show QEMU version',
             '    %s <zone uuid> query-vnc           show VNC information',
-            '    %s <zone uuid> quit                quit the emulator. WARNING: this will stop the qemu\n'
-           +'                                           process without sending a shutdown signal.',
+            '',
+            ' *  %s <zone uuid> migrate             migrate VM to destination',
+            '    %s <zone uuid> migrate_cancel      cancel migrate in progress',
+            '    %s <zone uuid> migrate_set_speed   set maximum speed for migrations',
+            '    %s <zone uuid> migrate_set_downtime',
+            '                                           set maximum downtime for migrations',
+            '    %s <zone uuid> client_migrate_info Set the spice/vnc connection info for the migration target',
+            '',
+            '    %s <zone uuid> quit                quit the emulator. WARNING: this will stop the emulator\n'
+           +'                                           process without sending a shutdown signal',
+            '    %s <zone uuid> cont                resume the emulator',
+            '    %s <zone uuid> stop                pause the emulator',
+            '',
             '    %s <zone uuid> system_powerdown    send system power down event',
             '    %s <zone uuid> system_reset        reset the system',
-            '    %s <zone uuid> system_wakeup       wake up system from suspend',
+            '',
+            ' *  %s <zone uuid> balloon             Request VM to change its memory allocation',
+            '    %s <zone uuid> block_passwd        Set the password of encrypted block devices',
+            '    %s <zone uuid> block_resize        Resize a block image while a guest is running',
+            '    %s <zone uuid> closefd             Close a file descriptor previously passed via SCM rights',
+            '    %s <zone uuid> cpu                 Set the default CPU',
+            '    %s <zone uuid> expire_password     Set the password expire time for vnc/spice protocols',
+            '    %s <zone uuid> getfd               Receive a file descriptor via SCM rights and assign it a name',
+            '    %s <zone uuid> human-monitor-command',
+            '                                           Execute a Human Monitor command',
+            '    %s <zone uuid> memsave             Save to disk virtual memory dump',
+            '    %s <zone uuid> netdev_add          Add host network device',
+            '    %s <zone uuid> netdev_del          Remove host network device',
+            '    %s <zone uuid> pmemsave            Save to disk physical memory dump',
+            '    %s <zone uuid> screendump          Save screen shot into PPM image',
+            '    %s <zone uuid> set_link            Change the link status of a network adapter',
+            '    %s <zone uuid> set_password        Set the password for vnc/spice protocols',
+            '',
+            '',
+            ' * Feature not working or not supported on SmartOS.',
             '',
             'See `%s help <command>` for more details.',
             ''
@@ -365,13 +751,13 @@ QMPADM.prototype.printError = function(err) {
     var self = this;
     if (err) {
         if (err.code) {
-            self.log.error(self.name + ': error ('+err.code+'):', err.message);
+            console.error(util.format('%s: error(%d):', self.name, err.code, err.message));
         } else {
-            self.log.error(self.name + ': error:', err.message || err);
+            console.error(util.format('%s: error:', self.name, err.message || err));
         }
         
         if (self.verbose && err.stack) {
-            self.log.error('\n' + err.stack);
+            console.error('\n' + err.stack);
         }
     }
 };
@@ -387,36 +773,48 @@ QMPADM.prototype.parseArgs = function(args) {
         'help_command': ''
     };
     
-    self.log.debug('incoming argv:', args);
-    
     var zoneId = false;
     var command = false;
     var help = false;
+    var pool = false;
+    var arg;
     
     if (args.length > 0) {
         // pop the prog name
-        args.shift();
-        args.shift();
+        args = args.slice(2);
     }
 
     while (args.length > 0) {
-        // GET Zone UUID
+    
+        // Process options and zone uuid
         if (!zoneId) {
-            var arg = args.shift();
+            arg = args.shift();
             
             if (arg === 'help' || arg === '-h' || arg === '-?') {
                 opts.command = 'help';
                 opts.help_command = '';
                 zoneId = help = true;
+                pool = false;
             } else if (arg === '-v' || arg === '--verbose') {
                 self.verbose = true;
+                pool = false;
+                continue;
+            } else if (arg === '-p' || arg === '--pool') {
+                pool = true;
                 continue;
             } else if (arg === '--version') {
                 console.log(NAME,' version ',VERSION);
                 process.exit(0);
+            } else if (pool) {
+                self.pool = '/' + arg.replace(/[\/']/g,'') + '/';
+                pool = false;
+                if (self.verbose)
+                    console.log(util.format('using pool %s', self.pool));
+                continue;
             } else if (isUuid(arg)) {
                 opts.zone = arg;
                 zoneId = true;
+                pool = false;
             } else {
                 args.unshift(arg);
             }
@@ -426,12 +824,14 @@ QMPADM.prototype.parseArgs = function(args) {
             var cmd = self.commands[opts.command];
             var option = '';
             
-            self.log.debug('parse command options:',cmd);
+            if (self.verbose)
+                console.log(util.format('parseArgs: %s: searching for args', opts.command));
             
             while (args.length > 0) {
                 var arg = args.shift();
                 
-                self.log.debug('arg:',arg);
+                if (self.verbose)
+                    console.log('parseArgs: got arg:',arg);
                 
                 if (arg.match(/^-/)) {
                     option === '';
@@ -442,7 +842,8 @@ QMPADM.prototype.parseArgs = function(args) {
                             break;
                         }
                     }
-                    self.log.debug('option:', option);
+                    if (self.verbose)
+                        console.log('parseArgs: found option:', option);
                     
                     if (option === '') {
                         self.printError({'message': 'Option '+arg+' not a valid option for '+opts.command});
@@ -453,19 +854,35 @@ QMPADM.prototype.parseArgs = function(args) {
                         opts.command_arguments[option] = ! cmd[option].default;
                     }
                 } else if (option !== '') {
-                    self.log.debug('option:', option);
+                    if (self.verbose)
+                        console.log(util.format('parseArgs: setting option: %s; value: %s', option, arg));
+                        
                     if (cmd[option].type === Boolean) {
-                         opts.command_arguments[option] = Boolean(arg);
+                        opts.command_arguments[option] = (arg.toLowerCase() === 'true');
+                    } else if (cmd[option].type === Number) {
+                        opts.command_arguments[option] = Number(arg);
+                        if (!opts.command_arguments[option] || opts.command_arguments[option] === 'NaN') {
+                            self.printError({message: 'Invalid number value '+arg});
+                        }
+                    } else if (cmd[option].type === Byte) {
+                        try {
+                            opts.command_arguments[option] = new Byte(arg).toInt();
+                        } catch (e) {
+                            self.printError(e);
+                        }
                     } else {
                         opts.command_arguments[option] = arg;
                     }
-                    self.log.debug('opts['+option+']:', opts.command_arguments[option]);
                     option = '';
                 }
             }
             
         } else if (help) {
             opts.help_command = args.shift();
+            
+            if (self.verbose)
+                console.log('parseArgs: checking for help command', opts.help_command);
+                        
             if (opts.help_command && !self.commands.hasOwnProperty(opts.help_command)) {
                 self.printError({'message': 'Unknown command '+opts.help_command});
                 opts.help_command = '';
@@ -476,18 +893,28 @@ QMPADM.prototype.parseArgs = function(args) {
             
             var validCommand = self.commands.hasOwnProperty(opts.command);
             
+            if (self.verbose)
+                console.log(util.format('parseArgs: command: %s; is valid: %s', opts.command, validCommand));
+            
             if (opts.command === 'help' || opts.command === '-h') {
                 help = true;
                 opts.command = 'help';
                 opts.help_command = '';
+                
+                if (self.verbose)
+                    console.log('parseArgs: found help command');
             } else if (validCommand) {
                 command = true;
                 var done = true;
                 var cmd = self.commands[opts.command];
                 for (var p in cmd) {
-                    if (cmd.hasOwnProperty(p)) { done = false; break; }
+                    if (!p.match(/^qmadm_/) && cmd.hasOwnProperty(p)) {
+                        done = false; break;
+                    }
                 }
                 if (done) {
+                    if (self.verbose)
+                        console.log(util.format('parseArgs: %s has no args; skipping options check', opts.command));
                     break;
                 }
             } else if (!validCommand) {
@@ -497,17 +924,17 @@ QMPADM.prototype.parseArgs = function(args) {
         }
     }
     
-    self.log.debug('check parsed args; command:', opts.command);
+    if (self.verbose)
+        console.log('parseArgs: parse complete. opts:\n', JSON.stringify(opts, null, 4));
     
-    if (opts.command !== 'help' && (!opts.zone || opts.zone === '')) {
+    if (opts.command !== 'help' && (!opts.zone || opts.zone.length === 0)) {
         self.printError({'message': 'A KVM zone UUID is required.'});
         process.exit(2);
-    } else if (opts.command !== 'help' && (!opts.command || opts.command === '')) {
+    } else if (opts.command !== 'help' && (!opts.command || opts.command.length === 0)) {
         self.printError({'message': 'No command specified.'});
         process.exit(2);
     } else if (opts.command !== 'help') {
         var cmd = self.commands[opts.command];
-        //opts.command_function = cmd.qmadm_function;
         
         for (var arg in cmd) {
             if (cmd.hasOwnProperty(arg)) {
@@ -517,6 +944,10 @@ QMPADM.prototype.parseArgs = function(args) {
                 }
             }
         }
+        
+        if (opts.command_arguments && opts.command_arguments.length === 0) {
+            opts.command_arguments = null;
+        }
     }
     
     return opts;
@@ -525,13 +956,21 @@ QMPADM.prototype.parseArgs = function(args) {
 QMPADM.prototype.doCommand = function(opts, callback) {
     var self = this;
     
-    var socket = ZONE_PATH + opts.zone + QMP_SOCKET;
+    var socket = self.pool + opts.zone + QMP_SOCKET;
     var qmp;
     
+    if (self.verbose)
+        console.log('doCommand: socket:', socket);
+    
     if (self.verbose) {
-        qmp = new QMP(self.log);
+        qmp = new Qmp({
+            debug: function(m){ console.log('Qmp [DEBUG]:', m); },
+            info:  function(m){ console.log('Qmp [INFO ]:', m); },
+            warn:  function(m){ console.log('Qmp [WARN ]:', m); },
+            error: function(m){ console.log('Qmp [ERROR]:', m); }
+        });
     } else {
-        qmp = new QMP({
+        qmp = new Qmp({
             debug: function(){},
             info: function(){},
             warn: function(){},
@@ -543,11 +982,8 @@ QMPADM.prototype.doCommand = function(opts, callback) {
         if (error) {
             self.printError({'message': 'Error connecting to zone: ' +opts.zone+'; socket: '+socket+'; Error: '+error});
         } else {
-            self.log.info('Connected to KVM', opts.zone, 'QMP socket');
+            console.log(util.format('Connected to KVM %sQMP socket', opts.zone));
             
-            if (opts.command_arguments && opts.command_arguments.length === 0) {
-                opts.command_arguments = null;
-            }
             qmp.command(opts.command, opts.command_arguments, function(error, results) {
                  callback(error, results);
                  qmp.disconnect();
@@ -565,8 +1001,7 @@ onlyif.rootInSmartosGlobal(function (onlyifErr) {
     }
     
     var opts = qmpadm.parseArgs(process.argv);
-    qmpadm.log.debug('parsed:', opts);
-    
+        
     if (opts.command === 'help') {
         qmpadm.printHelp(opts.help_command);
     } else {
@@ -574,11 +1009,15 @@ onlyif.rootInSmartosGlobal(function (onlyifErr) {
             if (error) {
                 qmpadm.printError(error);
             } else {
-                if (Object.keys(result).length === 0) {
-                    qmpadm.log.info('QMP results: Successful');
+                if (qmpadm.verbose)
+                    console.log('doCommand result:', result);
+                    
+                if (typeof result === 'object' && Object.keys(result).length === 0) {
+                    console.log('QMP results: Successful');
+                } else if (typeof result === 'object') {
+                    console.log('QMP results:\n',JSON.stringify(result, null, 4));
                 } else {
-                    qmpadm.log.info('QMP results:');
-                    console.log(JSON.stringify(result, null, 4));
+                    console.log('QMP results:', result);
                 }
             }
         });

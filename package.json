@@ -1,15 +1,10 @@
 {
     "name": "qmpadm",
-    "version": "0.0.1",
-    "description": "",
+    "version": "0.0.2",
+    "description": "Manage running KVM zones using the Qemu Machine Protocol (QMP).",
     "author": "Eric McPheron",
     "main": "qmpadm",
     "repository": "",
-    "bin": "",
-    "license": {
-        "type": "",
-        "url": ""
-    },
     "dependencies": {
     }
 }
