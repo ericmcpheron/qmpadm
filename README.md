@@ -12,7 +12,7 @@ Example install into `/opt/local/sbin`
 
 1. `mkdir -p /opt/local/sbin` (
 2. `cd /opt/local/sbin`
-3. `curl -kO {url}`
+3. `curl -kO https://raw.githubusercontent.com/ericmcpheron/qmpadm/master/qmpadm`
 4. `chmod 755 qmpadm`
 
 ## Dependencies
